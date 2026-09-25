@@ -246,3 +246,31 @@ class PreparationOut(BaseModel):
     created_at: str
     consumptions: list[PreparationConsumptionOut]  # 各原始样本整数消耗，按样本 id 升序
     remaining_inventory: list[InventoryOut]        # 扣减后的剩余库存，按样本 id 升序
+
+
+class PreparationJobItem(BaseModel):
+    """整单制备中的一项：已有批次 id + 正整数制备次数。"""
+
+    batch_id: StrictPositiveInt
+    times: StrictPositiveInt
+
+
+class PreparationJobCreateRequest(BaseModel):
+    """整单制备：非空清单；同一批次重复出现时由服务端先合并次数。"""
+
+    items: Annotated[list[PreparationJobItem], Field(min_length=1)]  # 拒绝空清单
+
+
+class PreparationJobBatchOut(BaseModel):
+    """整单中一个批次（合并重复项后）的制备记录。"""
+
+    batch_id: int
+    batch_name: BatchName
+    preparation_id: int  # 可由 GET /preparations/{id} 读取的制备记录 id
+    times: int           # 合并后的制备次数（正整数）
+    consumptions: list[PreparationConsumptionOut]  # 该批次沿配方图的整数消耗，按样本 id 升序
+
+
+class PreparationJobOut(BaseModel):
+    preparations: list[PreparationJobBatchOut]  # 各批次制备记录，按批次 id 升序、各一次
+    consumptions: list[PreparationConsumptionOut]  # 整单按样本汇总的总消耗，按样本 id 升序

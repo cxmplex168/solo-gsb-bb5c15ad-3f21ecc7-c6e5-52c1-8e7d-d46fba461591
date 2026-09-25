@@ -404,3 +404,24 @@ def preparation_requirements(
     kinds, recipes = _load_graph(conn)
     units = _unit_needs(kinds, recipes, batch_id, {})
     return {sample_id: unit * times for sample_id, unit in units.items()}
+
+
+def preparation_job_requirements(
+    conn: sqlite3.Connection, items: list[tuple[int, int]]
+) -> dict[int, dict[int, int]]:
+    """整单制备：计算每个批次（批次 id, 合并后的制备次数）对原始样本的整数需求。
+
+    返回 {批次 id: {原始样本 id: 份数}}，只含需求为正的样本。所有批次共用同一份
+    配方图与单位消耗 memo：不同批次经多路径汇合到同一中间批次时只计算一次；
+    整单按样本汇总的总需求由调用方求和（共享样本必须按汇总后的总需求核算，
+    不能让各项分别判为足量）。
+    """
+    kinds, recipes = _load_graph(conn)
+    memo: UnitNeeds = {}
+    return {
+        batch_id: {
+            sample_id: unit * times
+            for sample_id, unit in _unit_needs(kinds, recipes, batch_id, memo).items()
+        }
+        for batch_id, times in items
+    }

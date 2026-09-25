@@ -14,6 +14,7 @@
 - POST /batches/{batch_id}/inventory   为原始样本补入正整数份库存（累加）
 - GET  /batches/{batch_id}/inventory   查询原始样本库存余额
 - POST /batches/{batch_id}/preparations 批次制备：正整数次数，沿配方图整数消耗原始样本库存（不足 409 且整体回滚）
+- POST /preparation-jobs               整单制备：多批次清单合并核算，按样本汇总需求一次扣减（不足 409 且整单回滚）
 - GET  /preparations/{preparation_id}  按记录 id 查询制备记录（含消耗明细与当前剩余库存）
 """
 from __future__ import annotations
@@ -49,6 +50,9 @@ from .schemas import (
     PortionDiagnosisUndeterminedOut,
     PreparationConsumptionOut,
     PreparationCreateRequest,
+    PreparationJobBatchOut,
+    PreparationJobCreateRequest,
+    PreparationJobOut,
     PreparationOut,
     PreviewComponentOut,
     RecipeItemOut,
@@ -62,6 +66,7 @@ from .service import (
     exclusion_impact_preview,
     pool_plan,
     portion_diagnosis,
+    preparation_job_requirements,
     preparation_requirements,
     reachable_samples,
     recipe_preview,
@@ -831,6 +836,56 @@ def _build_preparation_out(
     )
 
 
+def _ensure_inventory(conn: sqlite3.Connection, required: dict[int, int]) -> None:
+    """在同一写事务内核对各原始样本余额是否满足（单次/整单）汇总需求。
+
+    任一样本不足即回滚当前事务并抛 409：detail.shortages 按样本 id 升序给出
+    每个缺口样本的总需求、余额与缺口；全部足量时不做任何修改、直接返回。
+    """
+    sample_ids = sorted(required)
+    balances = (
+        {
+            r["sample_id"]: r["balance"]
+            for r in conn.execute(
+                "SELECT sample_id, balance FROM sample_inventory WHERE sample_id IN (%s)"
+                % ", ".join("?" for _ in sample_ids),
+                sample_ids,
+            )
+        }
+        if sample_ids
+        else {}
+    )
+
+    shortages = []
+    for sid in sample_ids:
+        available = balances.get(sid, 0)
+        if available < required[sid]:
+            shortages.append({
+                "sample_id": sid,
+                "required": required[sid],
+                "available": available,
+                "shortage": required[sid] - available,
+            })
+    if not shortages:
+        return
+    shortage_ids = [item["sample_id"] for item in shortages]
+    names = {
+        r["id"]: r["name"]
+        for r in conn.execute(
+            "SELECT id, name FROM batches WHERE id IN (%s)"
+            % ", ".join("?" for _ in shortage_ids),
+            shortage_ids,
+        )
+    }
+    for item in shortages:
+        item["sample_name"] = names[item["sample_id"]]
+    conn.rollback()
+    raise HTTPException(
+        status.HTTP_409_CONFLICT,
+        detail={"message": "原始样本库存不足", "shortages": shortages},
+    )
+
+
 @app.post(
     "/batches/{batch_id}/preparations",
     response_model=PreparationOut,
@@ -855,46 +910,9 @@ def create_preparation(
         # 原始样本目标直接消耗自身（每制备一次 1 份）
         required = preparation_requirements(conn, batch_id, payload.times)
         sample_ids = sorted(required)
-        balances = {
-            r["sample_id"]: r["balance"]
-            for r in conn.execute(
-                """
-                SELECT sample_id, balance FROM sample_inventory
-                WHERE sample_id IN (%s)
-                """
-                % ", ".join("?" for _ in sample_ids),
-                sample_ids,
-            )
-        } if sample_ids else {}
 
         # 任一样本库存不足即整体回滚：库存与制备记录均不变化
-        shortages = []
-        for sid in sample_ids:
-            available = balances.get(sid, 0)
-            if available < required[sid]:
-                shortages.append({
-                    "sample_id": sid,
-                    "required": required[sid],
-                    "available": available,
-                    "shortage": required[sid] - available,
-                })
-        if shortages:
-            shortage_ids = [item["sample_id"] for item in shortages]
-            names = {
-                r["id"]: r["name"]
-                for r in conn.execute(
-                    "SELECT id, name FROM batches WHERE id IN (%s)"
-                    % ", ".join("?" for _ in shortage_ids),
-                    shortage_ids,
-                )
-            }
-            for item in shortages:
-                item["sample_name"] = names[item["sample_id"]]
-            conn.rollback()
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                detail={"message": "原始样本库存不足", "shortages": shortages},
-            )
+        _ensure_inventory(conn, required)
 
         # 足量：一次扣减并写入制备记录与消耗明细（同一事务提交）
         cur = conn.execute(
@@ -939,3 +957,107 @@ def get_preparation(
             status.HTTP_404_NOT_FOUND, detail=f"制备记录不存在: {preparation_id}"
         )
     return _build_preparation_out(conn, prep)
+
+
+@app.post(
+    "/preparation-jobs",
+    response_model=PreparationJobOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="整单制备：多批次清单合并核算，按样本汇总需求一次扣减（不足 409 且整单回滚）",
+)
+def create_preparation_job(
+    payload: PreparationJobCreateRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> PreparationJobOut:
+    # 同一批次在清单中重复出现时，先合并制备次数（与 /pools 合并重复原料一致）
+    merged: dict[int, int] = {}
+    for item in payload.items:
+        merged[item.batch_id] = merged.get(item.batch_id, 0) + item.times
+
+    ids = sorted(merged)
+    placeholders = ", ".join("?" for _ in ids)
+    rows = {
+        row["id"]: row
+        for row in conn.execute(
+            f"SELECT id, name FROM batches WHERE id IN ({placeholders})", ids
+        )
+    }
+    missing = [i for i in ids if i not in rows]
+    if missing:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"未知批次 id: {missing}")
+
+    # 与单批次制备同一事务模型：余额读取、缺口核算、库存扣减与各批次制备记录
+    # 写入都在同一 SQLite 写事务内完成（BEGIN IMMEDIATE 立即取写锁）
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # 沿配方图逐层乘算每项的整数需求，再按样本汇总整单需求：
+        # 共享样本按汇总后的总需求核算，不能让各项分别判为足量
+        per_batch = preparation_job_requirements(conn, [(i, merged[i]) for i in ids])
+        total: dict[int, int] = {}
+        for batch_id in ids:
+            for sample_id, portions in per_batch[batch_id].items():
+                total[sample_id] = total.get(sample_id, 0) + portions
+
+        # 任一样本不足：整单回滚，不留任何制备记录、余额不变
+        _ensure_inventory(conn, total)
+
+        # 全部足量：每个批次写入一条制备记录与消耗明细，整单按汇总需求一次扣减
+        preparation_ids: dict[int, int] = {}
+        for batch_id in ids:
+            cur = conn.execute(
+                "INSERT INTO preparations (batch_id, times) VALUES (?, ?)",
+                (batch_id, merged[batch_id]),
+            )
+            preparation_ids[batch_id] = cur.lastrowid
+            conn.executemany(
+                """
+                INSERT INTO preparation_consumptions (preparation_id, sample_id, portions)
+                VALUES (?, ?, ?)
+                """,
+                [
+                    (preparation_ids[batch_id], sid, per_batch[batch_id][sid])
+                    for sid in sorted(per_batch[batch_id])
+                ],
+            )
+        conn.executemany(
+            "UPDATE sample_inventory SET balance = balance - ? WHERE sample_id = ?",
+            [(total[sid], sid) for sid in sorted(total)],
+        )
+        conn.commit()
+    except HTTPException:
+        raise
+
+    # 响应中的样本名称一次性解析（消耗过的样本必然存在）
+    sample_ids = sorted(total)
+    sample_names = {
+        r["id"]: r["name"]
+        for r in conn.execute(
+            "SELECT id, name FROM batches WHERE id IN (%s)"
+            % ", ".join("?" for _ in sample_ids),
+            sample_ids,
+        )
+    }
+
+    def consumption_out(sample_id: int, portions: int) -> PreparationConsumptionOut:
+        return PreparationConsumptionOut(
+            sample_id=sample_id,
+            sample_name=sample_names[sample_id],
+            portions=portions,
+        )
+
+    return PreparationJobOut(
+        preparations=[
+            PreparationJobBatchOut(
+                batch_id=batch_id,
+                batch_name=rows[batch_id]["name"],
+                preparation_id=preparation_ids[batch_id],
+                times=merged[batch_id],
+                consumptions=[
+                    consumption_out(sid, per_batch[batch_id][sid])
+                    for sid in sorted(per_batch[batch_id])
+                ],
+            )
+            for batch_id in ids
+        ],
+        consumptions=[consumption_out(sid, total[sid]) for sid in sample_ids],
+    )
