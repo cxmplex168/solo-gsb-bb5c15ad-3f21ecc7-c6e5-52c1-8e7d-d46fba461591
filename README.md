@@ -14,6 +14,7 @@
 - **配方变更影响预演**：提交完整替代配方，在内存中演算目标批次及全部下游批次各原始样本的原占比、预演占比与有符号差值，**不修改数据库**
 - **份数诊断**：假设混样配方仅一项投入份数记错，按实测原始样本占比用有理数方程反推该项的正整数份数，并用全部样本占比复核；份数变化不改变组成且与实测吻合的项列为**无法判定**；**不修改数据库**
 - **原始样本库存与批次制备**：可为已有原始样本补入**正整数份**库存并查询余额；`POST /batches/{id}/preparations` 按**正整数次数**制备批次，每制备一次混样按其配方消耗相应份数的上游批次，沿配方图逐层乘算、多路径需求合并为各原始样本的**整数消耗**（原始样本目标直接消耗自身）；核算与扣减在**同一 SQLite 写事务**内完成，任一样本库存不足即返回 **409** 与各样缺口、库存与制备记录均不变化，足量时一次扣减并保存目标批次、次数与消耗明细，可按记录 id 查询
+- **整单制备**：`POST /preparation-jobs` 接收**非空制备清单**（每项 = 已有批次 id + 正整数制备次数，同一批次重复出现时先合并次数），逐项沿配方图计算整数需求后**按样本汇总整单需求**——共享样本不会被各项分别判为足量；余额读取、缺口核算、库存扣减与各批次制备记录写入在**同一写事务**内完成，任一样本不足返回 **409**（含该样本整单总需求、余额与缺口）且整单不留记录、余额不变；成功时返回各批次制备记录 id 与整单消耗，记录可由 `GET /preparations/{id}` 读取
 - 依赖安装与数据库建表全部纳入启动流程，无需手工初始化
 
 ## 快速开始（Docker）
@@ -63,6 +64,7 @@ docker compose up --build
 | `GET` | `/batches/{id}/inventory` | 查询原始样本库存余额（未补入为 0） |
 | `POST` | `/batches/{id}/preparations` | 批次制备：按整数次数消耗原始样本库存（不足 409 且整体回滚） |
 | `GET` | `/preparations/{id}` | 按记录 id 查询制备记录（消耗明细 + 当前剩余库存） |
+| `POST` | `/preparation-jobs` | 整单制备：非空清单合并核算，同一写事务扣减并写入各批次制备记录（不足 409 且整单回滚） |
 
 ## 示例请求
 
@@ -427,6 +429,68 @@ curl -X POST http://localhost:8000/batches/4/preparations \
 - 制备次数必须为严格正整数（0、负数、小数、字符串、布尔均 **422**）；目标批次不存在返回 **400**；
 - 并发制备由同一写事务串行：不会出现库存超扣（余额恒非负），库存只够部分请求时其余请求得到 409 且不留任何记录。
 
+### 11. 整单制备（多批次合并核算）
+
+`POST /preparation-jobs` 接收**非空制备清单**：`items` 的每项为已有批次 id（`batch_id`）与正整数制备次数（`times`）。同一批次在清单中**重复出现时先把次数合并**，再逐项沿配方图计算各原始样本的整数需求，最后**按样本汇总整单需求**与余额比对——被多项共享的样本按整单总量核算，不会被各项分别判为足量。
+
+**余额读取、缺口核算、库存扣减与各批次制备记录写入在同一个 SQLite 写事务内完成**（`BEGIN IMMEDIATE` 立即取写锁）：
+
+- 任一样本**整单需求超过余额**：整单回滚返回 **409**，`detail.shortages` 按样本 id 升序列出每个缺口样本的**整单总需求**、可用余额与缺口，**不留任何制备记录、余额不变**，可补足后原样重试；
+- **全部足量**：逐项写入制备记录（批次、合并后的次数、消耗明细）并按整单汇总一次扣减库存，返回 **201**：各批次的制备记录 id 与整单按样本汇总的消耗。每条记录都可由 `GET /preparations/{id}` 照常读取。
+
+沿用前面的批次（P1=`1×S1+1×S2` id=3，P2=`1×P1+1×S1` id=4，制备一次需 2×S1、1×S2）。当前库存 S1=10、S2=5，提交整单：P2 制备 2 次（清单中重复出现，合并为 2 次）+ P1 制备 1 次，整单消耗 S1 = 2×2+1 = 5、S2 = 2×1+1 = 3：
+
+```bash
+curl -X POST http://localhost:8000/preparation-jobs \
+  -H 'Content-Type: application/json' \
+  -d '{"items": [{"batch_id": 4, "times": 1}, {"batch_id": 3, "times": 1}, {"batch_id": 4, "times": 1}]}'
+```
+
+```json
+{
+  "preparations": [
+    {"preparation_id": 1, "batch_id": 3, "batch_name": "P1", "times": 1},
+    {"preparation_id": 2, "batch_id": 4, "batch_name": "P2", "times": 2}
+  ],
+  "consumptions": [
+    {"sample_id": 1, "sample_name": "S1", "portions": 5},
+    {"sample_id": 2, "sample_name": "S2", "portions": 3}
+  ]
+}
+```
+
+各批次记录可由现有查询接口读取（消耗明细为该项自身的整数需求，剩余库存为查询时实时余额）：
+
+```bash
+curl http://localhost:8000/preparations/2
+# {"id":2,"batch_id":4,"batch_name":"P2","times":2,"consumptions":[{"sample_id":1,...,"portions":4},{"sample_id":2,...,"portions":2}],"remaining_inventory":[...]}
+```
+
+共享样本按整单汇总核算的例子：库存 S1 余 5 份，整单为 S1 本身 3 次 + P1 3 次——单项各需 3 份都“够”，但整单共需 6 份，返回 **409** 且余额不变、不留记录：
+
+```bash
+curl -X POST http://localhost:8000/preparation-jobs \
+  -H 'Content-Type: application/json' \
+  -d '{"items": [{"batch_id": 1, "times": 3}, {"batch_id": 3, "times": 3}]}'
+```
+
+```json
+{
+  "detail": {
+    "message": "原始样本库存不足",
+    "shortages": [
+      {"sample_id": 1, "sample_name": "S1", "required": 6, "available": 5, "shortage": 1}
+    ]
+  }
+}
+```
+
+说明：
+
+- 空清单（`items: []`）返回 **422**；`batch_id` / `times` 必须为严格正整数（0、负数、小数、字符串、布尔均 **422**）；引用不存在的批次返回 **400**，且整单不执行；
+- 清单中只有一项时，效果与 `POST /batches/{id}/preparations` 一致，只是响应按整单结构返回；
+- 并发整单由同一写事务串行：不会出现库存超扣，库存只够部分整单时其余请求得到 409 且不留任何记录。
+
 ### 错误示例
 
 ```bash
@@ -517,6 +581,15 @@ curl -X POST http://localhost:8000/batches/4/preparations -H 'Content-Type: appl
 
 # 查询不存在的制备记录 → 404
 curl http://localhost:8000/preparations/999
+
+# 整单制备：空清单 → 422；未知批次 → 400；共享样本整单汇总不足 → 409（整单不留记录、余额不变）
+curl -X POST http://localhost:8000/preparation-jobs -H 'Content-Type: application/json' \
+  -d '{"items": []}'
+curl -X POST http://localhost:8000/preparation-jobs -H 'Content-Type: application/json' \
+  -d '{"items": [{"batch_id": 999, "times": 1}]}'
+curl -X POST http://localhost:8000/preparation-jobs -H 'Content-Type: application/json' \
+  -d '{"items": [{"batch_id": 1, "times": 3}, {"batch_id": 3, "times": 3}]}'
+# {"detail":{"message":"原始样本库存不足","shortages":[{"sample_id":1,"sample_name":"S1","required":6,"available":5,"shortage":1}]}}
 ```
 
 ## 占比计算说明
@@ -540,12 +613,12 @@ pytest                                 # 运行测试（使用临时数据库，
 
 ```
 app/
-  main.py       # FastAPI 路由与请求处理（禁配规则、目标占比规划、配方预演、份数诊断、库存补入与批次制备端点）
+  main.py       # FastAPI 路由与请求处理（禁配规则、目标占比规划、配方预演、份数诊断、库存补入、批次制备与整单制备端点）
   db.py         # SQLite 连接与建表（启动时自动执行，含禁配规则、库存与制备记录表及写事务设置）
   schemas.py    # Pydantic 请求/响应模型（含严格正整数校验）
   service.py    # 递归占比计算、配方图可达原始样本、禁配补录影响预演、目标占比反算、配方预演、份数诊断与制备整数消耗（Fraction 精确分数）
 tests/
-  test_api.py   # 端到端测试（含多级合并、约分、占比规划、配方预演、份数诊断、禁配规则与补录影响预演、库存与制备扣减、并发与各类非法输入）
+  test_api.py   # 端到端测试（含多级合并、约分、占比规划、配方预演、份数诊断、禁配规则与补录影响预演、库存与制备扣减、整单制备、并发与各类非法输入）
 Dockerfile
 docker-compose.yml
 requirements.txt

@@ -15,6 +15,7 @@
 - GET  /batches/{batch_id}/inventory   查询原始样本库存余额
 - POST /batches/{batch_id}/preparations 批次制备：正整数次数，沿配方图整数消耗原始样本库存（不足 409 且整体回滚）
 - GET  /preparations/{preparation_id}  按记录 id 查询制备记录（含消耗明细与当前剩余库存）
+- POST /preparation-jobs               整单制备：非空清单合并核算，同一写事务扣减并写入各批次制备记录（不足 409 且整单回滚）
 """
 from __future__ import annotations
 
@@ -49,6 +50,9 @@ from .schemas import (
     PortionDiagnosisUndeterminedOut,
     PreparationConsumptionOut,
     PreparationCreateRequest,
+    PreparationJobCreateRequest,
+    PreparationJobItemOut,
+    PreparationJobOut,
     PreparationOut,
     PreviewComponentOut,
     RecipeItemOut,
@@ -939,3 +943,141 @@ def get_preparation(
             status.HTTP_404_NOT_FOUND, detail=f"制备记录不存在: {preparation_id}"
         )
     return _build_preparation_out(conn, prep)
+
+
+@app.post(
+    "/preparation-jobs",
+    response_model=PreparationJobOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="整单制备：多批次合并核算原始样本需求（同一写事务扣减与记录）",
+)
+def create_preparation_job(
+    payload: PreparationJobCreateRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> PreparationJobOut:
+    # 同一批次在清单中重复出现时，先合并制备次数（与 /pools 合并重复原料一致）
+    merged: dict[int, int] = {}
+    for item in payload.items:
+        merged[item.batch_id] = merged.get(item.batch_id, 0) + item.times
+
+    # 未知批次按业务输入错误返回 400（与 /pools、单批次制备一致）
+    ids = sorted(merged)
+    placeholders = ", ".join("?" for _ in ids)
+    found = {
+        row["id"]
+        for row in conn.execute(f"SELECT id FROM batches WHERE id IN ({placeholders})", ids)
+    }
+    missing = [i for i in ids if i not in found]
+    if missing:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail=f"未知批次 id: {missing}"
+        )
+
+    # 与单批次制备同一事务模型：余额读取、缺口核算、库存扣减与各批次制备记录
+    # 写入都在同一 SQLite 写事务内完成（BEGIN IMMEDIATE 立即取写锁），
+    # 任一样本不足则整单回滚：不留任何制备记录、余额不变
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # 逐项沿配方图计算整数需求，再按样本汇总整单需求：共享样本按整单总量
+        # 与余额比对，不会被各项分别判为足量
+        per_item = {bid: preparation_requirements(conn, bid, merged[bid]) for bid in ids}
+        total_required: dict[int, int] = {}
+        for required in per_item.values():
+            for sid, portions in required.items():
+                total_required[sid] = total_required.get(sid, 0) + portions
+
+        sample_ids = sorted(total_required)
+        balances = {
+            r["sample_id"]: r["balance"]
+            for r in conn.execute(
+                """
+                SELECT sample_id, balance FROM sample_inventory
+                WHERE sample_id IN (%s)
+                """
+                % ", ".join("?" for _ in sample_ids),
+                sample_ids,
+            )
+        } if sample_ids else {}
+
+        # 任一样本整单需求超过余额即整体回滚：库存与制备记录均不变化
+        shortages = []
+        for sid in sample_ids:
+            available = balances.get(sid, 0)
+            if available < total_required[sid]:
+                shortages.append({
+                    "sample_id": sid,
+                    "required": total_required[sid],
+                    "available": available,
+                    "shortage": total_required[sid] - available,
+                })
+        if shortages:
+            shortage_ids = [item["sample_id"] for item in shortages]
+            names = {
+                r["id"]: r["name"]
+                for r in conn.execute(
+                    "SELECT id, name FROM batches WHERE id IN (%s)"
+                    % ", ".join("?" for _ in shortage_ids),
+                    shortage_ids,
+                )
+            }
+            for item in shortages:
+                item["sample_name"] = names[item["sample_id"]]
+            conn.rollback()
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={"message": "原始样本库存不足", "shortages": shortages},
+            )
+
+        # 足量：逐项写入制备记录与消耗明细，按整单汇总一次扣减各样本库存（同一事务提交）
+        preparation_ids: dict[int, int] = {}
+        for bid in ids:
+            cur = conn.execute(
+                "INSERT INTO preparations (batch_id, times) VALUES (?, ?)",
+                (bid, merged[bid]),
+            )
+            preparation_ids[bid] = cur.lastrowid
+            conn.executemany(
+                """
+                INSERT INTO preparation_consumptions (preparation_id, sample_id, portions)
+                VALUES (?, ?, ?)
+                """,
+                [
+                    (preparation_ids[bid], sid, per_item[bid][sid])
+                    for sid in sorted(per_item[bid])
+                ],
+            )
+        conn.executemany(
+            "UPDATE sample_inventory SET balance = balance - ? WHERE sample_id = ?",
+            [(total_required[sid], sid) for sid in sample_ids],
+        )
+        conn.commit()
+    except HTTPException:
+        raise
+
+    # 一次性解析批次与样本名称，组装整单响应
+    involved = sorted(set(ids) | set(sample_ids))
+    names = {
+        r["id"]: r["name"]
+        for r in conn.execute(
+            "SELECT id, name FROM batches WHERE id IN (%s)"
+            % ", ".join("?" for _ in involved),
+            involved,
+        )
+    }
+    return PreparationJobOut(
+        preparations=[
+            PreparationJobItemOut(
+                preparation_id=preparation_ids[bid],
+                batch_id=bid,
+                batch_name=names[bid],
+                times=merged[bid],
+            )
+            for bid in ids
+        ],
+        consumptions=[
+            PreparationConsumptionOut(
+                sample_id=sid, sample_name=names[sid], portions=total_required[sid]
+            )
+            for sid in sample_ids
+        ],
+    )

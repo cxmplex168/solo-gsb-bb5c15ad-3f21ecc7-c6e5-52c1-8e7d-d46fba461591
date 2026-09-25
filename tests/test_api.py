@@ -1502,3 +1502,190 @@ def test_concurrent_preparations_serialize_without_overselling(client):
     list_resp = [client.get(f"/preparations/{i}").status_code for i in range(1, 7)]
     assert list_resp == [200] * 5 + [404]
 
+
+# --------------------------------------------------------------------------- #
+# POST /preparation-jobs 整单制备
+# --------------------------------------------------------------------------- #
+
+
+def prepare_job(client, items):
+    return client.post("/preparation-jobs", json={"items": items})
+
+
+def test_preparation_job_merges_duplicates_and_returns_records(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    # P1 = 1×S1 + 1×S2；P2 = 1×P1 + 1×S1（制备一次需 2×S1、1×S2）
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    p2 = make_pool(client, "P2", [
+        {"batch_id": p1, "portions": 1}, {"batch_id": s1, "portions": 1}])
+    add_inventory(client, s1, 100)
+    add_inventory(client, s2, 100)
+
+    # P2 重复出现，次数先合并为 3；整单 = P1×1 + P2×3 → S1: 1+6=7，S2: 1+3=4
+    r = prepare_job(client, [
+        {"batch_id": p2, "times": 2},
+        {"batch_id": p1, "times": 1},
+        {"batch_id": p2, "times": 1},
+    ])
+    assert r.status_code == 201, r.text
+    body = r.json()
+    # 各批次制备记录按批次 id 升序，重复项已合并
+    assert [(p["batch_id"], p["times"]) for p in body["preparations"]] == [
+        (p1, 1), (p2, 3)]
+    assert [p["batch_name"] for p in body["preparations"]] == ["P1", "P2"]
+    prep_ids = [p["preparation_id"] for p in body["preparations"]]
+    assert len(set(prep_ids)) == 2
+    # 整单按样本汇总的消耗
+    assert body["consumptions"] == [
+        {"sample_id": s1, "sample_name": "S1", "portions": 7},
+        {"sample_id": s2, "sample_name": "S2", "portions": 4},
+    ]
+    assert get_inventory(client, s1).json()["balance"] == 93
+    assert get_inventory(client, s2).json()["balance"] == 96
+
+    # 各批次记录可由现有查询接口读取，消耗明细为该项自身的整数需求
+    rec1 = client.get(f"/preparations/{prep_ids[0]}")
+    assert rec1.status_code == 200, rec1.text
+    assert rec1.json()["batch_id"] == p1
+    assert rec1.json()["times"] == 1
+    assert rec1.json()["consumptions"] == [
+        {"sample_id": s1, "sample_name": "S1", "portions": 1},
+        {"sample_id": s2, "sample_name": "S2", "portions": 1},
+    ]
+    rec2 = client.get(f"/preparations/{prep_ids[1]}")
+    assert rec2.status_code == 200, rec2.text
+    assert rec2.json()["batch_id"] == p2
+    assert rec2.json()["times"] == 3
+    assert rec2.json()["consumptions"] == [
+        {"sample_id": s1, "sample_name": "S1", "portions": 6},
+        {"sample_id": s2, "sample_name": "S2", "portions": 3},
+    ]
+
+
+def test_preparation_job_shared_sample_aggregated_across_items(client):
+    # 共享样本不能被各项分别判为足量：单项各需 3 份、余额 5 份，整单需 6 份 → 409
+    s1 = make_sample(client, "S1")
+    p1 = make_pool(client, "P1", [{"batch_id": s1, "portions": 1}])
+    add_inventory(client, s1, 5)
+
+    r = prepare_job(client, [
+        {"batch_id": s1, "times": 3},   # 原始样本目标直接消耗自身
+        {"batch_id": p1, "times": 3},   # 经配方图同样消耗 S1
+    ])
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["message"] == "原始样本库存不足"
+    # 缺口按整单汇总需求给出：总需求 6、余额 5、缺口 1
+    assert detail["shortages"] == [{
+        "sample_id": s1, "sample_name": "S1",
+        "required": 6, "available": 5, "shortage": 1,
+    }]
+
+    # 整单不留记录且余额不变
+    assert get_inventory(client, s1).json()["balance"] == 5
+    assert client.get("/preparations/1").status_code == 404
+    # 补足后可原样重试成功
+    add_inventory(client, s1, 1)
+    assert prepare_job(client, [
+        {"batch_id": s1, "times": 3},
+        {"batch_id": p1, "times": 3},
+    ]).status_code == 201
+    assert get_inventory(client, s1).json()["balance"] == 0
+
+
+def test_preparation_job_conflict_changes_nothing(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 2}, {"batch_id": s2, "portions": 1}])
+    add_inventory(client, s1, 3)   # 制备 2 次需 4×S1，不足
+    add_inventory(client, s2, 100)
+    before_s1 = get_inventory(client, s1).json()
+    before_s2 = get_inventory(client, s2).json()
+
+    r = prepare_job(client, [{"batch_id": p1, "times": 2}])
+    assert r.status_code == 409
+    assert r.json()["detail"]["shortages"] == [{
+        "sample_id": s1, "sample_name": "S1",
+        "required": 4, "available": 3, "shortage": 1,
+    }]
+    # 库存与制备记录均不变化
+    assert get_inventory(client, s1).json() == before_s1
+    assert get_inventory(client, s2).json() == before_s2
+    assert client.get("/preparations/1").status_code == 404
+
+
+def test_preparation_job_exact_total_balance_succeeds(client):
+    # 整单汇总需求恰好等于余额：视为足量，扣减后余额为 0
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    add_inventory(client, s1, 3)
+    add_inventory(client, s2, 2)
+    r = prepare_job(client, [
+        {"batch_id": p1, "times": 2},   # 2×S1、2×S2
+        {"batch_id": s1, "times": 1},   # 1×S1
+    ])
+    assert r.status_code == 201, r.text
+    assert r.json()["consumptions"] == [
+        {"sample_id": s1, "sample_name": "S1", "portions": 3},
+        {"sample_id": s2, "sample_name": "S2", "portions": 2},
+    ]
+    assert get_inventory(client, s1).json()["balance"] == 0
+    assert get_inventory(client, s2).json()["balance"] == 0
+
+
+def test_preparation_job_empty_items_rejected(client):
+    r = prepare_job(client, [])
+    assert r.status_code == 422
+
+
+@pytest.mark.parametrize("times", [0, -3, 1.5, 2.0, "2", True])
+def test_preparation_job_rejects_non_positive_integer_times(client, times):
+    s1 = make_sample(client, "S1")
+    r = prepare_job(client, [{"batch_id": s1, "times": times}])
+    assert r.status_code == 422
+
+
+def test_preparation_job_unknown_batch_rejected(client):
+    s1 = make_sample(client, "S1")
+    r = prepare_job(client, [
+        {"batch_id": s1, "times": 1},
+        {"batch_id": 999, "times": 1},
+    ])
+    assert r.status_code == 400
+    assert "999" in r.json()["detail"]
+    # 未知批次导致整单不执行：不扣库存、不留记录
+    assert get_inventory(client, s1).json()["balance"] == 0
+    assert client.get("/preparations/1").status_code == 404
+
+
+def test_concurrent_preparation_jobs_serialize_without_overselling(client):
+    # 并发整单制备：库存只够部分整单成功，写事务串行化后不允许超扣或残留记录
+    s1 = make_sample(client, "S1")
+    p1 = make_pool(client, "P1", [{"batch_id": s1, "portions": 1}])
+    add_inventory(client, s1, 5)
+    barrier = threading.Barrier(6)
+    codes: list[int] = []
+    lock = threading.Lock()
+
+    def create():
+        barrier.wait()
+        r = prepare_job(client, [{"batch_id": p1, "times": 1}])
+        with lock:
+            codes.append(r.status_code)
+
+    threads = [threading.Thread(target=create) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(codes) == [201] * 5 + [409]
+    assert get_inventory(client, s1).json()["balance"] == 0
+    list_resp = [client.get(f"/preparations/{i}").status_code for i in range(1, 7)]
+    assert list_resp == [200] * 5 + [404]
+
